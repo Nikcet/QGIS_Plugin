@@ -23,12 +23,20 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QVariant
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
+from qgis.core import QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, QgsField
+from qgis.utils import iface
+
+import requests
+from requests.models import Response
+from shapely.geometry import shape
+
 
 # Initialize Qt resources from file resources.py
 from .resources import *
+
 # Import the code for the dialog
 from .database_syncer_dialog import TestCaseDialog
 import os.path
@@ -50,11 +58,10 @@ class TestCase:
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
         # initialize locale
-        locale = QSettings().value('locale/userLocale')[0:2]
+        locale = QSettings().value("locale/userLocale")[0:2]
         locale_path = os.path.join(
-            self.plugin_dir,
-            'i18n',
-            'TestCase_{}.qm'.format(locale))
+            self.plugin_dir, "i18n", "TestCase_{}.qm".format(locale)
+        )
 
         if os.path.exists(locale_path):
             self.translator = QTranslator()
@@ -63,11 +70,12 @@ class TestCase:
 
         # Declare instance attributes
         self.actions = []
-        self.menu = self.tr(u'&Тестовое задание для Python/GIS-разработчика')
+        self.menu = self.tr("&Тестовое задание для Python/GIS-разработчика")
 
         # Check if plugin was started the first time in current QGIS session
         # Must be set in initGui() to survive plugin reloads
         self.first_start = None
+        self.syncer = DatabaseSyncer(iface)
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -82,8 +90,7 @@ class TestCase:
         :rtype: QString
         """
         # noinspection PyTypeChecker,PyArgumentList,PyCallByClass
-        return QCoreApplication.translate('TestCase', message)
-
+        return QCoreApplication.translate("TestCase", message)
 
     def add_action(
         self,
@@ -95,7 +102,8 @@ class TestCase:
         add_to_toolbar=True,
         status_tip=None,
         whats_this=None,
-        parent=None):
+        parent=None,
+    ):
         """Add a toolbar icon to the toolbar.
 
         :param icon_path: Path to the icon for this action. Can be a resource
@@ -151,9 +159,7 @@ class TestCase:
             self.iface.addToolBarIcon(action)
 
         if add_to_menu:
-            self.iface.addPluginToMenu(
-                self.menu,
-                action)
+            self.iface.addPluginToMenu(self.menu, action)
 
         self.actions.append(action)
 
@@ -162,25 +168,23 @@ class TestCase:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/database_syncer/icon.png'
         self.add_action(
-            icon_path,
-            text=self.tr(u''),
-            callback=self.run,
-            parent=self.iface.mainWindow())
+            icon_path=":/plugins/database_syncer/icon.png",
+            text=self.tr("Синхронизация"),
+            callback=self.syncer.sync_with_server,
+            parent=self.iface.mainWindow(),
+        )
 
         # will be set False in run()
         self.first_start = True
-
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         for action in self.actions:
             self.iface.removePluginMenu(
-                self.tr(u'&Тестовое задание для Python/GIS-разработчика'),
-                action)
+                self.tr("&Тестовое задание для Python/GIS-разработчика"), action
+            )
             self.iface.removeToolBarIcon(action)
-
 
     def run(self):
         """Run method that performs all the real work"""
@@ -191,12 +195,194 @@ class TestCase:
             self.first_start = False
             self.dlg = TestCaseDialog()
 
-        # show the dialog
-        self.dlg.show()
-        # Run the dialog event loop
-        result = self.dlg.exec_()
-        # See if OK was pressed
-        if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+        # # show the dialog
+        # self.dlg.show()
+        # # Run the dialog event loop
+        # result = self.dlg.exec_()
+        # # See if OK was pressed
+        # if result:
+        #     # Do something useful here - delete the line containing pass and
+        #     # substitute with your code.
+        #     pass
+
+
+class DatabaseSyncer:
+    types = [
+        ("Points_synced", "Point"),
+        ("Lines_synced", "LineString"),
+        ("Polygons_synced", "Polygon"),
+    ]
+    url = "http://127.0.0.1:8000"
+
+    def __init__(self, iface):
+        self.iface = iface
+        self.message = self.iface.messageBar
+        self.layers = {}
+        self.instance = QgsProject.instance()
+
+    def init_layers(self):
+        for name, geom_type in self.types:
+            layer = self.get_layer_by_name(name)
+            if not layer:
+                uri = f"{geom_type}?crs=EPSG:4326"
+                layer = QgsVectorLayer(uri, name, "memory")
+
+                self.instance.addMapLayer(layer)
+
+                layer.featureAdded.connect(self.on_feature_added)
+                layer.featureDeleted.connect(self.on_feature_deleted)
+
+            else:
+                # Проверяем, не подключены ли уже сигналы
+                try:
+                    layer.featureAdded.disconnect(self.on_feature_added)
+                except Exception:
+                    pass
+                layer.featureAdded.connect(self.on_feature_added)
+                try:
+                    layer.featureDeleted.disconnect(self.on_feature_deleted)
+                except Exception:
+                    pass
+                layer.featureDeleted.connect(self.on_feature_deleted)
+            self.layers[name] = layer
+
+    def get_layer_by_name(self, name: str) -> QgsVectorLayer | None:
+        for layer in self.instance.mapLayers().values():
+            if layer.name() == name:
+                return layer
+        return None
+
+    def sync_with_server(self):
+        self.init_layers()
+
+        try:
+            self.upload_all_features_to_server()
+
+            self.message().pushMessage(
+                "Инфо", f"Данные отправлены на сервер", level=0, duration=5
+            )
+        except Exception as e:
+            self.message().pushMessage(
+                "Инфо",
+                f"Произошла ошибка при отправке данных: {e}",
+                level=2,
+                duration=5,
+            )
+
+        for layer in self.layers.values():
+            layer.dataProvider().truncate()
+
+        features, error = self.get_features_from_server()
+        if error:
+            self.message().pushMessage(
+                "Ошибка", f"Ошибка при получении данных: {error}", level=2, duration=5
+            )
+            return
+        if not features:
+            self.message().pushMessage(
+                "Синхронизация", "Данные не найдены на сервере", level=1, duration=3
+            )
+            return
+        self.add_features_to_layers(features)
+        self.message().pushMessage(
+            "Синхронизация", "Данные успешно загружены с сервера", level=0, duration=3
+        )
+
+    def upload_all_features_to_server(self):
+        """
+        Отправляет все объекты из всех слоёв на сервер (POST /features)
+        """
+        for name, layer in self.layers.items():
+            for feature in layer.getFeatures():
+                geom = feature.geometry().asJson()
+                type_ = feature["type"] if "type" in feature.fields().names() else None
+                try:
+                    requests.post(
+                        f"{self.url}/features",
+                        json={
+                            "geometry": geom,
+                            "type": str(type_) if type_ is not None else type_,
+                        },
+                    )
+                except Exception as e:
+                    self.message().pushMessage(
+                        "Ошибка",
+                        f"Ошибка при отправке объекта: {e}",
+                        level=2,
+                        duration=5,
+                    )
+
+    def get_features_from_server(self):
+        try:
+            res = requests.get(f"{self.url}/features")
+            if res.status_code == 200:
+                data = res.json()
+                return data.get("features", []), None
+            else:
+                return [], f"Код ответа: {res.status_code}, {res.text}"
+        except Exception as e:
+            return [], str(e)
+
+    def add_features_to_layers(self, features):
+        for feature in features:
+            geom_type = feature["geometry"]["type"]
+
+            qgs_feature = QgsFeature()
+
+            # Преобразуем GeoJSON geometry в WKT через shapely
+            wkt = shape(feature["geometry"]).wkt
+
+            qgs_geom = QgsGeometry.fromWkt(wkt)
+
+            qgs_feature.setGeometry(qgs_geom)
+            # qgs_feature.setAttributes([feature["properties"].get("type")])
+
+            if geom_type == "Point":
+                layer = self.layers.get("Points_synced")
+            elif geom_type == "LineString":
+                layer = self.layers.get("Lines_synced")
+            elif geom_type == "Polygon":
+                layer = self.layers.get("Polygons_synced")
+            else:
+                continue
+            if layer:
+                layer.dataProvider().addFeatures([qgs_feature])
+                layer.updateExtents()
+
+    def on_feature_added(self, fid):
+        self.message().pushMessage(
+            "Сохранение", "Добавление объекта", level=0, duration=3
+        )
+        for name, layer in self.layers.items():
+            
+            feature = next(layer.getFeatures(f"id = {fid}"), None)
+
+            if feature:
+                geom = feature.geometry().asJson()
+
+                resp = requests.post(
+                    f"{self.url}/features",
+                    json={"geometry": geom},
+                )
+                if resp.status_code == 200:
+                    self.message().pushMessage(
+                        "Сохранение", "Объект отправлен на сервер", level=0, duration=3
+                    )
+                else:
+                    self.message().pushMessage(
+                        "Ошибка",
+                        "Ошибка при отправке объекта на сервер",
+                        level=2,
+                        duration=5,
+                    )
+
+    def on_feature_deleted(self, fid):
+        resp = requests.delete(f"{self.url}/features/{fid}")
+        if resp.status_code == 200:
+            self.message().pushMessage(
+                "Удаление", "Объект удален с сервера", level=0, duration=3
+            )
+
+
+def classFactory(iface):
+    return DatabaseSyncer(iface)
